@@ -8,6 +8,8 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"strconv"
+	"strings"
 
 	"github.com/containernetworking/cni/pkg/ipam"
 	"github.com/containernetworking/cni/pkg/ns"
@@ -49,36 +51,27 @@ func loadConf(bytes []byte, args string) (*SriovConf, error) {
 }
 
 func setupVF(conf *SriovConf, ifName string, netns ns.NetNS) error {
+	var err error
+	var vfDevName string
+
 	vfIdx := 0
 	masterName := conf.Net.Master
 	args := conf.Args
 
 	if args.VF != 0 {
 		vfIdx = args.VF
+	} else {
+		// alloc a free virtual function
+		if vfIdx, vfDevName, err = allocFreeVF(masterName); err != nil {
+			return err
+		}
 	}
-	// TODO: if conf.VF == nil, alloc vf randomly
 
 	m, err := netlink.LinkByName(masterName)
 	if err != nil {
 		return fmt.Errorf("failed to lookup master %q: %v", masterName, err)
 	}
 
-	vfDir := fmt.Sprintf("/sys/class/net/%s/device/virtfn%d/net", masterName, vfIdx)
-	if _, err := os.Lstat(vfDir); err != nil {
-		return err
-	}
-
-	infos, err := ioutil.ReadDir(vfDir)
-	if err != nil {
-		return err
-	}
-
-	if len(infos) != 1 {
-		return fmt.Errorf("no network devices in directory %s", vfDir)
-	}
-
-	// VF NIC name
-	vfDevName := infos[0].Name()
 	vfDev, err := netlink.LinkByName(vfDevName)
 	if err != nil {
 		return fmt.Errorf("failed to lookup vf device %q: %v", vfDevName, err)
@@ -180,7 +173,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return err
 	}
 
-	if err:= resetCniArgsForIPAM(n.Args); err != nil {
+	if err := resetCniArgsForIPAM(n.Args); err != nil {
 		return err
 	}
 
@@ -220,7 +213,7 @@ func cmdDel(args *skel.CmdArgs) error {
 		return err
 	}
 
-	if err:= resetCniArgsForIPAM(n.Args); err != nil {
+	if err := resetCniArgsForIPAM(n.Args); err != nil {
 		return err
 	}
 
@@ -252,6 +245,67 @@ func resetCniArgsForIPAM(args *NetArgs) error {
 	}
 
 	return nil
+}
+
+func allocFreeVF(master string) (int, string, error) {
+	vfIdx := -1
+	devName := ""
+
+	sriovFile := fmt.Sprintf("/sys/class/net/%s/device/sriov_numvfs", master)
+	if _, err := os.Lstat(sriovFile); err != nil {
+		return -1, "", fmt.Errorf("failed to open the sriov_numfs of device %q: %v", master, err)
+	}
+
+	data, err := ioutil.ReadFile(sriovFile)
+	if err != nil {
+		return -1, "", fmt.Errorf("failed to read the sriov_numfs of device %q: %v", master, err)
+	}
+
+	if len(data) == 0 {
+		return -1, "", fmt.Errorf("no data in the file %q", sriovFile)
+	}
+
+	sriovNumfs := strings.TrimSpace(string(data))
+	vfTotal, err := strconv.Atoi(sriovNumfs)
+	if err != nil {
+		return -1, "", fmt.Errorf("failed to convert sriov_numfs(byte value) to int of device %q: %v", master, err)
+	}
+
+	if vfTotal <= 0 {
+		return -1, "", fmt.Errorf("no virtual function in the device %q: %v", master)
+	}
+
+	for vf := 0; vf < vfTotal; vf++ {
+		devName, err = getVFDeviceName(master, vf)
+
+		// got a free vf
+		if err == nil {
+			vfIdx = vf
+			break
+		}
+	}
+
+	if vfIdx == -1 {
+		return -1, "", fmt.Errorf("can not get a free virtual function in directory %s", master)
+	}
+	return vfIdx, devName, nil
+}
+
+func getVFDeviceName(master string, vf int) (string, error) {
+	vfDir := fmt.Sprintf("/sys/class/net/%s/device/virtfn%d/net", master, vf)
+	if _, err := os.Lstat(vfDir); err != nil {
+		return "", fmt.Errorf("failed to open the virtfn%d dir of the device %q: %v", vf, master, err)
+	}
+
+	infos, err := ioutil.ReadDir(vfDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to read the virtfn%d dir of the device %q: %v", vf, master, err)
+	}
+
+	if len(infos) != 1 {
+		return "", fmt.Errorf("no network device in directory %s", vfDir)
+	}
+	return infos[0].Name(), nil
 }
 
 func main() {
