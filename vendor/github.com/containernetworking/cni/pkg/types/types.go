@@ -70,6 +70,7 @@ type Result struct {
 	IP4 *IPConfig `json:"ip4,omitempty"`
 	IP6 *IPConfig `json:"ip6,omitempty"`
 	DNS DNS       `json:"dns,omitempty"`
+	Raw []byte    `json:"-"`
 }
 
 func (r *Result) Print() error {

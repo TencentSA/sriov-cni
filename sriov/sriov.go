@@ -14,9 +14,11 @@ import (
 	"github.com/containernetworking/cni/pkg/ipam"
 	"github.com/containernetworking/cni/pkg/ns"
 	"github.com/containernetworking/cni/pkg/skel"
+	"github.com/containernetworking/cni/pkg/types"
 	"github.com/vishvananda/netlink"
 
 	. "github.com/hustcat/sriov-cni/config"
+	"github.com/hustcat/sriov-cni/util"
 )
 
 func init() {
@@ -38,7 +40,7 @@ func loadConf(bytes []byte, args string) (*SriovConf, error) {
 	}
 
 	if args != "" {
-		err := LoadSriovArgs(args, a)
+		err := types.LoadArgs(args, a)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse args: %v", err)
 		}
@@ -51,15 +53,24 @@ func loadConf(bytes []byte, args string) (*SriovConf, error) {
 }
 
 func setupVF(conf *SriovConf, ifName string, netns ns.NetNS) error {
-	var err error
-	var vfDevName string
+	var (
+		err       error
+		vfDevName string
+		vfIdx     int = 0
+		vlan      int
+		mac       string
+	)
 
-	vfIdx := 0
 	masterName := conf.Net.Master
 	args := conf.Args
 
+	// get vf device name
 	if args.VF != 0 {
-		vfIdx = args.VF
+		vfIdx = int(args.VF)
+		vfDevName, err = getVFDeviceName(masterName, vfIdx)
+		if err != nil {
+			return err
+		}
 	} else {
 		// alloc a free virtual function
 		if vfIdx, vfDevName, err = allocFreeVF(masterName); err != nil {
@@ -79,7 +90,8 @@ func setupVF(conf *SriovConf, ifName string, netns ns.NetNS) error {
 
 	// set hardware address
 	if args.MAC != "" {
-		macAddr, err := net.ParseMAC(args.MAC)
+		mac = string(args.MAC)
+		macAddr, err := net.ParseMAC(mac)
 		if err != nil {
 			return err
 		}
@@ -89,7 +101,8 @@ func setupVF(conf *SriovConf, ifName string, netns ns.NetNS) error {
 	}
 
 	if args.VLAN != 0 {
-		if err = netlink.LinkSetVfVlan(m, vfIdx, args.VLAN); err != nil {
+		vlan = int(args.VLAN)
+		if err = netlink.LinkSetVfVlan(m, vfIdx, vlan); err != nil {
 			return fmt.Errorf("failed to set vf %d vlan: %v", vfIdx, err)
 		}
 	}
@@ -113,10 +126,13 @@ func setupVF(conf *SriovConf, ifName string, netns ns.NetNS) error {
 }
 
 func releaseVF(conf *SriovConf, ifName string, netns ns.NetNS) error {
-	vfIdx := 0
+	var (
+		vfIdx int = 0
+	)
+
 	args := conf.Args
 	if args.VF != 0 {
-		vfIdx = args.VF
+		vfIdx = int(args.VF)
 	}
 
 	initns, err := ns.GetCurrentNS()
@@ -124,43 +140,64 @@ func releaseVF(conf *SriovConf, ifName string, netns ns.NetNS) error {
 		return fmt.Errorf("failed to get init netns: %v", err)
 	}
 
-	if err = netns.Set(); err != nil {
-		return fmt.Errorf("failed to enter netns %q: %v", netns, err)
-	}
+	// for IPAM CmdDel
+	return netns.Do(func(_ ns.NetNS) error {
+		// get VF device
+		vfDev, err := netlink.LinkByName(ifName)
+		if err != nil {
+			return fmt.Errorf("failed to lookup vf %d device %q: %v", vfIdx, ifName, err)
+		}
 
-	// get VF device
-	vfDev, err := netlink.LinkByName(ifName)
-	if err != nil {
-		return fmt.Errorf("failed to lookup vf %d device %q: %v", vfIdx, ifName, err)
-	}
+		// device name in init netns
+		index := vfDev.Attrs().Index
+		devName := fmt.Sprintf("dev%d", index)
 
-	// device name in init netns
-	index := vfDev.Attrs().Index
-	devName := fmt.Sprintf("dev%d", index)
+		// shutdown VF device
+		if err = netlink.LinkSetDown(vfDev); err != nil {
+			return fmt.Errorf("failed to down vf %d device: %v", vfIdx, err)
+		}
 
-	// shutdown VF device
-	if err = netlink.LinkSetDown(vfDev); err != nil {
-		return fmt.Errorf("failed to down vf %d device: %v", vfIdx, err)
-	}
+		// rename VF device
+		err = renameLink(ifName, devName)
+		if err != nil {
+			return fmt.Errorf("failed to rename vf %d evice %q to %q: %v", vfIdx, ifName, devName, err)
+		}
 
-	// rename VF device
-	err = renameLink(ifName, devName)
-	if err != nil {
-		return fmt.Errorf("failed to rename vf %d evice %q to %q: %v", vfIdx, ifName, devName, err)
-	}
-
-	// move VF device to init netns
-	if err = netlink.LinkSetNsFd(vfDev, int(initns.Fd())); err != nil {
-		return fmt.Errorf("failed to move vf %d to init netns: %v", vfIdx, err)
-	}
-
-	return nil
+		// move VF device to init netns
+		if err = netlink.LinkSetNsFd(vfDev, int(initns.Fd())); err != nil {
+			return fmt.Errorf("failed to move vf %d to init netns: %v", vfIdx, err)
+		}
+		return nil
+	})
 }
 
 func cmdAdd(args *skel.CmdArgs) error {
-	n, err := loadConf(args.StdinData, args.Args)
+	sc, err := loadConf(args.StdinData, args.Args)
 	if err != nil {
 		return err
+	}
+
+	// run the IPAM plugin and get back the config to apply
+	result, err := ipam.ExecAdd(sc.Net.IPAM.Type, args.StdinData)
+	if err != nil {
+		return err
+	}
+	if result.IP4 == nil {
+		return errors.New("IPAM plugin returned missing IPv4 config")
+	}
+
+	rr, err := convertCniTypesToTxipamTypes(result)
+	if err != nil {
+		return fmt.Errorf("Convert result error: %v", err)
+	}
+
+	ex := rr.Extra
+	if ex != nil {
+		sc.Args.MAC = types.UnmarshallableString(ex.MAC)
+		sc.Args.VLAN = UnmarshallableInt(ex.VLAN)
+		if ex.VF != nil {
+			sc.Args.VF = UnmarshallableInt(*ex.VF)
+		}
 	}
 
 	netns, err := ns.GetNS(args.Netns)
@@ -169,21 +206,8 @@ func cmdAdd(args *skel.CmdArgs) error {
 	}
 	defer netns.Close()
 
-	if err = setupVF(n, args.IfName, netns); err != nil {
+	if err = setupVF(sc, args.IfName, netns); err != nil {
 		return err
-	}
-
-	if err := resetCniArgsForIPAM(n.Args); err != nil {
-		return err
-	}
-
-	// run the IPAM plugin and get back the config to apply
-	result, err := ipam.ExecAdd(n.Net.IPAM.Type, args.StdinData)
-	if err != nil {
-		return err
-	}
-	if result.IP4 == nil {
-		return errors.New("IPAM plugin returned missing IPv4 config")
 	}
 
 	err = netns.Do(func(_ ns.NetNS) error {
@@ -193,12 +217,19 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return err
 	}
 
-	result.DNS = n.Net.DNS
+	// set CPU affinity for VF
+	if sc.Args.CORES != "" {
+		if err = setupVfCpuAffinity(sc.Net.Master, args.IfName, string(sc.Args.CORES), int(sc.Args.VF)); err != nil {
+			return err
+		}
+	}
+
+	result.DNS = sc.Net.DNS
 	return result.Print()
 }
 
 func cmdDel(args *skel.CmdArgs) error {
-	n, err := loadConf(args.StdinData, args.Args)
+	sc, err := loadConf(args.StdinData, args.Args)
 	if err != nil {
 		return err
 	}
@@ -209,15 +240,11 @@ func cmdDel(args *skel.CmdArgs) error {
 	}
 	defer netns.Close()
 
-	if err = releaseVF(n, args.IfName, netns); err != nil {
+	if err = releaseVF(sc, args.IfName, netns); err != nil {
 		return err
 	}
 
-	if err := resetCniArgsForIPAM(n.Args); err != nil {
-		return err
-	}
-
-	err = ipam.ExecDel(n.Net.IPAM.Type, args.StdinData)
+	err = ipam.ExecDel(sc.Net.IPAM.Type, args.StdinData)
 	if err != nil {
 		return err
 	}
@@ -232,19 +259,6 @@ func renameLink(curName, newName string) error {
 	}
 
 	return netlink.LinkSetName(link, newName)
-}
-
-func resetCniArgsForIPAM(args *NetArgs) error {
-	argVal := ""
-
-	if args.IP != nil {
-		argVal = fmt.Sprintf("IP=%s", args.IP.String())
-	}
-	if err := os.Setenv("CNI_ARGS", argVal); err != nil {
-		return fmt.Errorf("reset cni args for ipam failed: %v", err)
-	}
-
-	return nil
 }
 
 func allocFreeVF(master string) (int, string, error) {
@@ -308,6 +322,37 @@ func getVFDeviceName(master string, vf int) (string, error) {
 	return infos[0].Name(), nil
 }
 
-func main() {
-	skel.PluginMain(cmdAdd, cmdDel)
+func setupVfCpuAffinity(master, ifName, cores string, vf int) error {
+	var (
+		cur    int = 0
+		maxIdx int = 0
+	)
+
+	coreArr := strings.Split(cores, ",")
+	maxIdx = len(coreArr)
+	if maxIdx == 0 {
+		return fmt.Errorf("CPU cores can not be empty")
+	}
+
+	irqs, err := util.GetVfIrqs(master, vf)
+	if err != nil {
+		return err
+	}
+
+	for _, irq := range irqs {
+		cs := coreArr[cur%maxIdx]
+		cur += 1
+		core, err := strconv.Atoi(cs)
+		if err != nil {
+			return fmt.Errorf("convert cpu core %s error: %v", cores, err)
+		}
+		if err = util.SetIrqCpuAffinity(irq, core); err != nil {
+			return err
+		}
+	}
+
+	/* need enter container mount namespace do this
+	return util.SetRpsCpuAffinity(ifName, cores)
+	*/
+	return nil
 }

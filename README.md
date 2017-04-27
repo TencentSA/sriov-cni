@@ -38,6 +38,12 @@ options ixgbe max_vfs=8,8
 * `vlan` (int, optional): VLAN ID for VF device
 * `mac` (string, optional): mac address for VF device
 
+## With `txipam`
+
+* `PodID` (string, required): pod id
+* `HostIP` (string, reqired): host IP
+* `CORES` (string, optional): VF binding CPU core
+
 ## Usage
 
 Given the following network configuration:
@@ -49,12 +55,9 @@ Given the following network configuration:
     "type": "sriov",
     "master": "eth1",
     "ipam": {
-        "type": "fixipam",
-        "subnet": "10.55.206.0/26",
-        "routes": [
-            { "dst": "0.0.0.0/0" }
-        ],
-        "gateway": "10.55.206.1"
+        "type": "txipam",
+        "remote": "https://127.0.0.1:10000",
+        "ca": "/etc/pki/ca-trust/source/anchors/ca.crt"
     }
 }
 EOF
@@ -64,39 +67,37 @@ Add container to network:
 
 ```sh
 # CNI_PATH=`pwd`/bin
-# cd scripts
-# CNI_PATH=$CNI_PATH CNI_ARGS="IP=10.55.206.46;VF=1;MAC=66:d8:02:77:aa:aa" ./priv-net-run.sh ifconfig
-contid=148e21a85bcc7aaf
-netnspath=/var/run/netns/148e21a85bcc7aaf
-eth0      Link encap:Ethernet  HWaddr 66:D8:02:77:AA:AA  
-          inet addr:10.55.206.46  Bcast:0.0.0.0  Mask:255.255.255.192
-          inet6 addr: fe80::64d8:2ff:fe77:aaaa/64 Scope:Link
-          UP BROADCAST RUNNING MULTICAST  MTU:1500  Metric:1
-          RX packets:0 errors:0 dropped:0 overruns:0 frame:0
-          TX packets:7 errors:0 dropped:0 overruns:0 carrier:0
-          collisions:0 txqueuelen:1000 
-          RX bytes:0 (0.0 b)  TX bytes:558 (558.0 b)
+# CNI_PATH=$CNI_PATH CNI_COMMAND=ADD CNI_NETNS=/var/run/netns/1234 CNI_CONTAINERID=1234 CNI_IFNAME=eth1 CNI_ARGS="IgnoreUnknown=1;PodID=1234;HostIP=10.55.206.20;CORES=1,2,3,4" bin/sriov < /etc/cni/net.d/txnet.conf
+{
+    "ip4": {
+        "ip": "10.55.206.46/26",
+        "gateway": "10.55.206.1"
+    },
+    "dns": {}
+}
 
-lo        Link encap:Local Loopback  
-          inet addr:127.0.0.1  Mask:255.0.0.0
-          inet6 addr: ::1/128 Scope:Host
-          UP LOOPBACK RUNNING  MTU:65536  Metric:1
-          RX packets:0 errors:0 dropped:0 overruns:0 frame:0
-          TX packets:0 errors:0 dropped:0 overruns:0 carrier:0
-          collisions:0 txqueuelen:0 
-          RX bytes:0 (0.0 b)  TX bytes:0 (0.0 b)
+# ip netns exec 1234 ip a
+1: lo: <LOOPBACK> mtu 65536 qdisc noop state DOWN
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+13: eth1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP qlen 1000
+    link/ether aa:bb:cc:dd:ee:ff brd ff:ff:ff:ff:ff:ff
+    inet 10.55.206.46/26 scope global eth1
+       valid_lft forever preferred_lft forever
+    inet6 fe80::a8bb:ccff:fedd:eeff/64 scope link
+       valid_lft forever preferred_lft forever
+
+# ls /sys/class/net/eth1/device/virtfn1/msi_irqs/
+174  175
+# cat /proc/irq/174/smp_affinity
+0000,00000002
+# cat /proc/irq/175/smp_affinity
+0000,00000004
 ```
 
 Remove container from network:
 
 ```sh
-# CNI_PATH=$CNI_PATH ./exec-plugins.sh del $contid /var/run/netns/$contid
-```
-
-For example:
-
-```sh
-# CNI_PATH=$CNI_PATH ./exec-plugins.sh del 148e21a85bcc7aaf /var/run/netns/148e21a85bcc7aaf
+# CNI_PATH=$CNI_PATH CNI_COMMAND=DEL CNI_NETNS=/var/run/netns/1234 CNI_CONTAINERID=1234 CNI_IFNAME=eth1 CNI_ARGS="PodID=1234;HostIP=10.55.206.20" bin/sriov < /etc/cni/net.d/txnet.conf
 ```
 
 [More info](https://github.com/containernetworking/cni/pull/259).

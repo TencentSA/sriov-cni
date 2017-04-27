@@ -48,6 +48,7 @@ func ExecPluginWithResult(pluginPath string, netconf []byte, args CNIArgs) (*typ
 
 	res := &types.Result{}
 	err = json.Unmarshal(stdoutBytes, res)
+	res.Raw = append([]byte(nil), stdoutBytes...)
 	return res, err
 }
 

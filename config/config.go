@@ -1,8 +1,6 @@
 package config
 
 import (
-	"net"
-
 	"github.com/containernetworking/cni/pkg/types"
 )
 
@@ -13,10 +11,10 @@ type NetConf struct {
 
 type NetArgs struct {
 	types.CommonArgs
-	VF   int    `json:"vf,omitempty"`
-	VLAN int    `json:"vlan,omitempty"`
-	MAC  string `json:"mac,omitempty"`
-	IP   net.IP `json:"ip,omitempty"`
+	VF    UnmarshallableInt          `json:"vf,omitempty"`
+	VLAN  UnmarshallableInt          `json:"vlan,omitempty"`
+	MAC   types.UnmarshallableString `json:"mac,omitempty"`
+	CORES types.UnmarshallableString `json:"cores,omitempty"`
 }
 
 type SriovConf struct {

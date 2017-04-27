@@ -1,4 +1,4 @@
-package config
+package types
 
 import (
 	"encoding"
@@ -50,8 +50,8 @@ func GetKeyField(keyString string, v reflect.Value) reflect.Value {
 	return v.Elem().FieldByName(keyString)
 }
 
-// LoadSriovArgs parses args from a string in the form "K=V;K2=V2;..."
-func LoadSriovArgs(args string, container interface{}) error {
+// LoadArgs parses args from a string in the form "K=V;K2=V2;..."
+func LoadArgs(args string, container interface{}) error {
 	if args == "" {
 		return nil
 	}
